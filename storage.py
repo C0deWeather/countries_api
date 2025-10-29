@@ -136,6 +136,59 @@ class DBStorage:
         cls.save()
 
     @classmethod
+    def query_by_filter(cls, args):
+        """Build SQL query based on filter arguments and execute it."""
+
+        filters = []
+        params = []
+
+        # if name filter is provided, fetch by name only
+        if name := args.get(name):
+            data = fetch_country(name)
+            if not data:
+                abort(
+                    404,
+                    description="Country not found")
+            return [data]
+
+        if currency_code := args.get("currency_code"):
+            filters.append("currency_code = ?")
+            params.append(currency_code)
+
+        elif region := args.get("region"):
+            filters.append("region = ?")
+            params.append(region)
+
+            if sort = "gdp_desc":
+                filters.append("estimated_gdp IS NOT NULL")
+                order_clause = "ORDER BY estimated_gdp DESC"
+            elif sort = "gdp_asc":
+                filters.append("estimated_gdp IS NOT NULL")
+                order_clause = "ORDER BY estimated_gdp ASC"
+            else:
+                order_clause = ""
+
+        # no filters, select all
+        where_clause = " AND ".join(filters) if filters else "1=1"
+
+        # build query
+        query = f"""
+            SELECT countries.*
+            FROM countries
+            WHERE {where_clause}
+            {order_clause};
+        """
+        data = storage.fetchall(query, tuple(params))
+        if not data:
+            abort(
+                404,
+                description="No countries found matching the criteria"
+            )
+        return data 
+
+
+
+    @classmethod
     def delete_country(cls, name):
         """Delete a country record by its name."""
         cls.__cursor.execute("DELETE FROM countries WHERE name = ?", (name,))
