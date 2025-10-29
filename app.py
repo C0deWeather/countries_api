@@ -1,15 +1,35 @@
 #!/usr/bin/env python3
+from api_clients import fetch_countries_data, fetch_exchange_rates
+from datetime import datetime
 from flask import Flask, jsonify, abort, request
-from pydantic import BaseModel, Field, ValidationError
-from models import storage
 import os
+from pydantic import BaseModel, Field, ValidationError
+from storage import DBStorage
+from utils import compute_est_gdp
 
 
 app = Flask(__name__)
+storage = DBStorage()
 
 # do not sort JSON keys
 app.json.sort_keys = False
 
+class Arguments(BaseModel):
+    """Model for query parameters for /countries endpoint."""
+
+    currency_code: str | None = Field(
+        default=None,
+        description="Filter countries by currency code"
+    )
+    region: str | None = Field(
+        default=None,
+        description="Filter countries by region"
+    )
+    sort: str | None = Field(
+        default=None,
+        description="Sort countries by estimated GDP. "
+                    "Accepted values: 'gdp_asc', 'gdp_desc'"
+    )
 
 @app.post('/countries/refresh')
 def refresh():
@@ -18,19 +38,26 @@ def refresh():
     and updates the local database accordingly.
     """
     storage.reload()
+    raw_data = fetch_countries_data()
+    currency_code = None
+    exchange_rate = None
+    estimated_gdp = None
 
     # Fetch existing country records from db
     records = storage.get_all_countries()
-
-    raw_data = fetch_countries_data()
+    print("records is a ", type(records))
+    
     if not records:
         # No existing records, perform initial population
         for entry in raw_data:
-            if entry.currencies:
-                currency_code = entry.currencies[0].get('code')
-                exchange_rate = fetch_exchange_rate(currency_code)
+            if entry.get('currencies'):
+                currency_code = entry['currencies'][0].get('code')
+                exchange_rate = fetch_exchange_rates(currency_code)
                 if exchange_rate:
-                    estimated_gdp = compute_estimated_gdp(exchange_rate)
+                    estimated_gdp = compute_est_gdp(
+                        entry.get('population'),
+                        exchange_rate
+                    )
                 else:
                     estimated_gdp = None
                 record = {
@@ -40,195 +67,121 @@ def refresh():
                     "currency_code": currency_code,
                     "exchange_rate": exchange_rate,
                     "estimated_gdp": estimated_gdp,
-                    "flag_url": entry.get('flag')
+                    "flag_url": entry.get('flag'),
                     "last_refreshed_at": datetime.utcnow().isoformat() + "Z"
                 }
+                records.append(record)
         storage.populate_countries(records)
-    return jsonify(response), 201
 
-@app.get('/strings/<string_value>')
-def get_analysed_string(string_value):
+    else:
+        # Existing records found, perform update logic
+        parameters = []
+        for entry in raw_data:
+            if entry.get('currencies'):
+                currency_code = entry['currencies'][0].get('code')
+                exchange_rate = fetch_exchange_rates(currency_code)
+                if exchange_rate:
+                    estimated_gdp = compute_est_gdp(
+                        entry.get('population'),
+                        exchange_rate)
+                else:
+                    estimated_gdp = None
+                params = {
+                    "name": entry.get('name'),
+                    "population": entry.get('population'),
+                    "currency_code": currency_code,
+                    "exchange_rate": exchange_rate,
+                    "estimated_gdp": estimated_gdp,
+                    "flag_url": entry.get('flag'),
+                    "last_refreshed_at": datetime.utcnow().isoformat() + "Z"
+                }
+                parameters.append(params)
+            if parameters:
+                storage.update_countries(parameters)
+            
+    return jsonify(message="Database updated"), 201
+
+@app.get('/countries')
+def get_countries():
     """
-    This endpoint retrieves the analysis of a previously analysed string
+    This endpoint retrieves country data from the local database,
+    applying optional filters and sorting based on query parameters.
     """
     storage.reload()
-    record = storage.get_analysed_string_by_value(string_value)
-    if not record:
-        abort(
-            404,
-            description="String does not exist in the system")
-
-    # reconstruct AnalysedString object from db record
-    analysed_string = AnalysedString(record)
-    response = analysed_string.to_dict()
+    try:
+        args = Arguments(
+            currency_code=request.args.get('currency_code'),
+            region=request.args.get('region'),
+            sort=request.args.get('sort')
+        )
+    except ValidationError as e:
+        abort(400, description="Invalid query parameter values or types")
+    
+    response = storage.query_by_filter(args.dict())
     return jsonify(response), 200
 
-@app.get('/strings')
-def list_analysed_strings():
+@app.get('/countries/<name>')
+def get_country(name):
     """
-    This endpoint lists all analysed strings
+    This endpoint retrieves a specific country's data by its name.
     """
     storage.reload()
-    if not request.args:
-        records = storage.get_all_analysed_strings()
-        data = [AnalysedString(record).to_dict() for record in records]
-        response = {
-            "data": data,
-            "count": len(data),
-            "filters_applied": None
-        }
-        return jsonify(response), 200
+    response = storage.fetch_country(name)
+    if not response:
+        abort(404, description="Country not found")
+    
+    return jsonify(response), 200
 
-    data = get_data(request.args)
-
-    return jsonify({
-        "data": data,
-        "count": len(data),
-        "filters_applied": {
-            "is_palindrome": request.args.get('is_palindrome'),
-            "min_length": request.args.get("min_length"),
-            "max_length": request.args.get('max_length'),
-            "word_count": request.args.get('word_count'),
-            "contains_character": request.args.get('contains_character')
-        }
-    }), 200
-
-@app.get('/strings/filter-by-natural-language')
-def filter_by_natural_language():
+@app.delete('/countries/<name>')
+def delete_country(name):
+    """This endpoint deletes a specific country's record by its name."""
     storage.reload()
 
-    query = request.args.get('query', '').strip().lower()
-    if not query:
-        abort(400, description="Missing 'query' parameter")
-
-    parsed_filters = {}
-
-    try:
-        # --- NLP Heuristics ---
-        if "palindromic" in query or "palindrome" in query:
-            parsed_filters["is_palindrome"] = True
-
-        if "single word" in query or "one word" in query:
-            parsed_filters["word_count"] = 1
-
-        match_len = re.search(r'longer than (\d+)', query)
-        if match_len:
-            parsed_filters["min_length"] = int(match_len.group(1)) + 1
-
-        match_len_max = re.search(r'shorter than (\d+)', query)
-        if match_len_max:
-            parsed_filters["max_length"] = int(match_len_max.group(1)) - 1
-
-        match_contains = re.search(r'contain(?:ing)? the letter (\w)', query)
-        if match_contains:
-            parsed_filters["contains_character"] = match_contains.group(1)
-
-        # fallback heuristic for “first vowel”
-        if "first vowel" in query:
-            parsed_filters["contains_character"] = 'a'
-
-        if not parsed_filters:
-            abort(400, description = "Unable to parse natural language query")
-
-        # Get data based on parsed filters
-        data = get_data(parsed_filters)
-
-        return jsonify({
-            "data": data,
-            "count": len(data),
-            "interpreted_query": {
-                "original": query,
-                "parsed_filters": parsed_filters
-            }
-        }), 200
-
-    except Exception as e:
-        abort(422, description=str(e))
-
-
-@app.delete('/strings/<string_value>')
-def delete_string(string_value):
-    """Delete a string and all its related data."""
-    storage.reload()
-
-    record = storage.get_analysed_string_by_value(string_value)
+    record = fetch_country(name)
     if not record:
         abort(404, description='String not found')
 
-    storage.delete_string(record[0])  # record[0] is the id
+    storage.delete_country(name)
     return '', 204
 
-def error_response(code, e):
+@app.get('/status')
+def get_status():
+    """Return the total number of country records in the database
+    and last refreshed timestamp."""
+    storage.reload()
+    query = """
+        SELECT COUNT(*) as total_records,
+               MAX(last_refreshed_at) as last_refreshed_at
+        FROM countries;
+    """
+    row = storage.fetchone(query)
+    response = {
+        "total_records": row["total_records"],
+        "last_refreshed_at": row["last_refreshed_at"]
+    }
+    return jsonify(response), 200
+
+def error_response(code, error, e):
     response = {}
-    response["status"] = "error"
-    response["message"] = f"Error: {str(e)}"
+    response["error"] = error
+    response["details"] = e.description
     return jsonify(response), code
 
-def get_data(req_args):
-    """
-    Build SQL query based on provided filters, execute query and return results.
-    """
-    filters = []
-    params = []
-
-    try:
-        is_palindrome = req_args.get('is_palindrome')
-        min_length = req_args.get('min_length')
-        max_length = req_args.get('max_length')
-        word_count = req_args.get('word_count')
-        contains_character = req_args.get('contains_character')
-
-        if is_palindrome is not None:
-            if is_palindrome not in (True, False):
-                abort(
-                    400,
-                    description="Invalid query parameter values or types")
-            filters.append("is_palindrome = ?")
-            params.append(is_palindrome)
-
-        if min_length is not None:
-            filters.append("length >= ?")
-            params.append(min_length)
-
-        if max_length is not None:
-            filters.append("length <= ?")
-            params.append(max_length)
-        
-        if word_count is not None:
-            filters.append("word_count = ?")
-            params.append(word_count)
-
-        if contains_character:
-            filters.append("value LIKE ?")
-            params.append(f"%{contains_character}%")
-
-        # no filters, select all
-        where_clause = " AND ".join(filters) if filters else "1=1"
-
-        query = f"""
-            SELECT analysed_strings.*
-            FROM analysed_strings
-            JOIN string_properties
-            ON analysed_strings.id = string_properties.string_id
-            WHERE {where_clause};
-        """
-
-        print(query)
-        rows = storage.fetchall(query, tuple(params))
-        data = [AnalysedString(row).to_dict() for row in rows]
-        
-        return data
-
-    except Exception as e:
-        abort(422, description=str(e))
+@app.errorhandler(400)
+def handle_400_error(e):
+    return error_response(400, "Validation failed", e)
 
 @app.errorhandler(404)
-def handle_409_error(e):
-    return error_response(409, e)
+def handle_404_error(e):
+    return error_response(404, "Country not found", e)
 
 @app.errorhandler(500)
 def handle_500_error(e):
-    return error_response(500, e)
+    return error_response(500, "Internal server error", e)
+
+@app.errorhandler(503)
+def handle_503_error(e):        
+    return error_response(503, "External data source unavailable", e)
 
 @app.teardown_appcontext
 def close_db_connection(exception=None):
@@ -236,4 +189,4 @@ def close_db_connection(exception=None):
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)

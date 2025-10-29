@@ -1,0 +1,4 @@
+venv/
+__pyicache__/
+.env
+

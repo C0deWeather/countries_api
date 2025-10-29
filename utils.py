@@ -1,6 +1,6 @@
 import random
 
-def compute_est_gdp(population, exchange_rate):
+def compute_est_gdp(population: int, exchange_rate: float) -> float:
     """Compute estimated GDP based on population
     and a random value."""
 

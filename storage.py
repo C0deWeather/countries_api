@@ -1,9 +1,11 @@
 """This module defines the DBStorage class for managing MySQL database connections and operations."""
 from dotenv import load_dotenv
 from flask import abort
-import pymsql
-from pymsql import MySQLError
+import pymysql
+from pymysql import MySQLError
+from pymysql.cursors import DictCursor
 import os
+from typing import List
 
 
 load_dotenv()
@@ -23,16 +25,17 @@ class DBStorage:
         try:
             self.__cursor.execute("""
                 CREATE TABLE IF NOT EXISTS countries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id INT AUTO_INCREMENT PRIMARY KEY,
                     name VARCHAR(100),
                     region VARCHAR(50),
-                    population INTEGER,
+                    population INT,
                     currency_code VARCHAR(10),
                     exchange_rate DECIMAL(10, 6),
-                    estimated_gdp DOUBLE,
+                    estimated_gdp FLOAT,
                     flag_url TEXT,
                     last_refreshed_at VARCHAR(255)
                 );
+
             """)
             self.__conn.commit()
         except MySQLError as e:
@@ -43,19 +46,18 @@ class DBStorage:
         """Create or reload the database connection."""
         try:
             cls.__conn = pymysql.connect(
-                host=os.getenv("HOST"),
-                port=int(os.getenv("PORT")),
-                user=os.getenv("USER"),
-                password=os.getenv("PASSWORD"),
+                host=os.getenv("DB_HOST"),
+                port=int(os.getenv("DB_PORT")),
+                user=os.getenv("DB_USER"),
+                password=os.getenv("DB_PASSWORD"),
                 database=os.getenv("DB_NAME"),
-                cursorclass=pymysql.cursors.DictCursor
             )
-            cls.__cursor = cls.__conn.cursor()
+            cls.__cursor = cls.__conn.cursor(DictCursor)
         except MySQLError as e:
             abort(500, str(e))
 
     @classmethod
-    def execute(cls, query, params=()):
+    def execute(cls, query: str, params: tuple = ()):
         """Execute a SQL query with optional parameters."""
         try:
             cls.__cursor.execute(query, params)
@@ -64,16 +66,21 @@ class DBStorage:
             abort(500, description=f"couldn't execute query: {str(e)}")
 
     @classmethod
-    def fetchall(cls, query, params=()):
+    def fetchall(cls, query: str, params: tuple = ()) -> List[dict]:
         """Run a SELECT query and return all rows."""
         try:
             cls.__cursor.execute(query, params)
-            return cls.__cursor.fetchall()
+            result = cls.__cursor.fetchall()
+            print("fetchall result type:", type(result))
+            print("first record type:", type(result[0]) if result else "no records")
+            if result and not isinstance(result[0], dict):
+                abort(500, description="Database returned unexpected data format")
+            return list[result]
         except MySQLError:
             return []
 
     @classmethod
-    def fetchone(cls, query, params=()):
+    def fetchone(cls, query: str, params: tuple = ()):
         """Run a SELECT query and return a single row."""
         try:
             cls.__cursor.execute(query, params)
@@ -82,13 +89,14 @@ class DBStorage:
             return None
 
     @classmethod
-    def fetch_country(cls, name):
+    def fetch_country(cls, name: str) -> dict:
         """Retrieve a country record by its name."""
-        query = "SELECT * FROM countries WHERE name = ?;"
+        query = "SELECT * FROM countries WHERE name = %s;"
         return cls.fetchone(query, (name,))
 
     @classmethod
     def get_all_countries(cls):
+        print("The cursor being used is ", type(cls.__cursor))
         query = "SELECT * FROM countries;"
         return cls.fetchall(query)
 
@@ -104,7 +112,7 @@ class DBStorage:
             )
 
     @classmethod
-    def populate_table(cls, records):
+    def populate_countries(cls, records: List[dict]):
         """populate the countries table with a list of records."""
         
         for record in records:
@@ -119,7 +127,7 @@ class DBStorage:
                     flag_url,
                     last_refreshed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
             """
             params = (
                 record["name"],
@@ -136,7 +144,7 @@ class DBStorage:
         cls.save()
 
     @classmethod
-    def query_by_filter(cls, args):
+    def query_by_filter(cls, args: dict) -> List[dict]:
         """Build SQL query based on filter arguments and execute it."""
 
         filters = []
@@ -152,21 +160,23 @@ class DBStorage:
             return [data]
 
         if currency_code := args.get("currency_code"):
-            filters.append("currency_code = ?")
+            filters.append("currency_code = %s")
             params.append(currency_code)
 
         elif region := args.get("region"):
-            filters.append("region = ?")
+            filters.append("region = %s")
             params.append(region)
 
-            if sort = "gdp_desc":
+            if args.get('sort') == "gdp_desc":
                 filters.append("estimated_gdp IS NOT NULL")
                 order_clause = "ORDER BY estimated_gdp DESC"
-            elif sort = "gdp_asc":
+            elif args.get('sort') == "gdp_asc":
                 filters.append("estimated_gdp IS NOT NULL")
                 order_clause = "ORDER BY estimated_gdp ASC"
-            else:
+            elif args.get('sort') is None:
                 order_clause = ""
+            else:
+                abort(400, description="Invalid sort parameter")
 
         # no filters, select all
         where_clause = " AND ".join(filters) if filters else "1=1"
@@ -187,9 +197,36 @@ class DBStorage:
         return data 
 
 
-
     @classmethod
-    def delete_country(cls, name):
+    def update_countries(cls, parameters: List[dict]):
+        """Update multiple country records in the database."""
+
+        update_sql = """
+            UPDATE countries
+            SET population = %s,
+                currency_code = %s,
+                exchange_rate = %s,
+                estimated_gdp = %s,
+                flag_url = %s,
+                last_refreshed_at = %s
+            WHERE name = %s;
+        """
+
+        for params in parameters:
+            cls.execute(update_sql, (
+                params["population"],
+                params["currency_code"],
+                params["exchange_rate"],
+                params["estimated_gdp"],
+                params["flag_url"],
+                params["last_refreshed_at"],
+                params["name"]
+            ))
+
+        cls.save()
+            
+    @classmethod
+    def delete_country(cls, name: str):
         """Delete a country record by its name."""
         cls.__cursor.execute("DELETE FROM countries WHERE name = ?", (name,))
         cls.save()
